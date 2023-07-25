@@ -38,7 +38,7 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
 import diffusers
-from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel
+from diffusers import AutoencoderKL, DDPMScheduler, DiffusionPipeline, UNet2DConditionModel, StableDiffusionPipeline
 from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
 from diffusers.optimization import get_scheduler
@@ -181,6 +181,14 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--ckpt",
+        default=False,
+        action="store_true",
+        help=(
+            "ckpt/safetensors or diffusers full model."
+        ),
+    )
+    parser.add_argument(
         "--center_crop",
         default=False,
         action="store_true",
@@ -270,6 +278,8 @@ def parse_args():
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+    parser.add_argument("--lora_rank", default=4, type=int, help="lora linear rank.")
+    parser.add_argument("--text_encoder", action="store_true", help="if used, train text_encoder.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
     parser.add_argument(
@@ -347,6 +357,7 @@ def parse_args():
         args.local_rank = env_local_rank
 
     # Sanity checks
+    print(args.train_data_dir)
     if args.dataset_name is None and args.train_data_dir is None:
         raise ValueError("Need either a dataset name or a training folder.")
 
@@ -392,9 +403,11 @@ def main():
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
+    glb_seed = -1
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
+        glb_seed = args.seed
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -406,22 +419,38 @@ def main():
                 repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
             ).repo_id
     # Load scheduler, tokenizer and models.
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
-    )
-    text_encoder = CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
-    )
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
-    )
+    if args.ckpt:
+        pipeline = StableDiffusionPipeline.from_ckpt(args.pretrained_model_name_or_path, torch_dtype=torch.float16)
+    else:
+        pipeline = StableDiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path, torch_dtype=torch.float16)
+    
+    # noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    # tokenizer = CLIPTokenizer.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+    # )
+    # text_encoder = CLIPTextModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+    # )
+    # vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
+    # unet = UNet2DConditionModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+    # )
+
+    noise_scheduler = pipeline.scheduler
+    tokenizer = pipeline.tokenizer
+    text_encoder = pipeline.text_encoder
+    vae = pipeline.vae
+    unet = pipeline.unet
+    lora_rank = args.lora_rank
+
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
 
-    text_encoder.requires_grad_(False)
+    if args.text_encoder:
+        text_encoder.requires_grad_(True)
+    else:
+        text_encoder.requires_grad_(False)
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
@@ -461,8 +490,8 @@ def main():
         elif name.startswith("down_blocks"):
             block_id = int(name[len("down_blocks.")])
             hidden_size = unet.config.block_out_channels[block_id]
-
-        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim)
+        print(hidden_size, cross_attention_dim)
+        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, rank=lora_rank)
 
     unet.set_attn_processor(lora_attn_procs)
 
@@ -557,6 +586,9 @@ def main():
             data_files=data_files,
             cache_dir=args.cache_dir,
         )
+        print("")
+        print("dataset",dataset)
+        print("")
         # See more about loading custom images at
         # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
 
@@ -621,7 +653,7 @@ def main():
 
     with accelerator.main_process_first():
         if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
+            dataset["train"] = dataset["train"].shuffle(seed=glb_seed).select(range(args.max_train_samples))
         # Set the training transforms
         train_dataset = dataset["train"].with_transform(preprocess_train)
 
@@ -815,17 +847,26 @@ def main():
                     f" {args.validation_prompt}."
                 )
                 # create pipeline
-                pipeline = DiffusionPipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    unet=accelerator.unwrap_model(unet),
-                    revision=args.revision,
-                    torch_dtype=weight_dtype,
-                )
+                if args.ckpt:
+                    pipeline = StableDiffusionPipeline.from_ckpt(
+                        args.pretrained_model_name_or_path,
+                        unet=accelerator.unwrap_model(unet),
+                        revision=args.revision,
+                        torch_dtype=weight_dtype,
+                    )
+                else:
+                    pipeline = StableDiffusionPipeline.from_pretrained(
+                        args.pretrained_model_name_or_path,
+                        unet=accelerator.unwrap_model(unet),
+                        revision=args.revision,
+                        torch_dtype=weight_dtype,
+                    )
+
                 pipeline = pipeline.to(accelerator.device)
                 pipeline.set_progress_bar_config(disable=True)
 
                 # run inference
-                generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+                generator = torch.Generator(device=accelerator.device).manual_seed(glb_seed)
                 images = []
                 for _ in range(args.num_validation_images):
                     images.append(
@@ -853,7 +894,8 @@ def main():
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unet = unet.to(torch.float32)
-        unet.save_attn_procs(args.output_dir)
+        # unet.save_attn_procs(args.output_dir)
+        pipeline.save_pretrained(save_directory=args.output_dir, safe_serialization=False)
 
         if args.push_to_hub:
             save_model_card(
@@ -872,16 +914,21 @@ def main():
 
     # Final inference
     # Load previous pipeline
-    pipeline = DiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=weight_dtype
-    )
+    if args.ckpt:
+        pipeline = StableDiffusionPipeline.from_ckpt(
+            args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=weight_dtype
+        )
+    else:
+        pipeline = StableDiffusionPipeline.from_pretrained(
+            args.pretrained_model_name_or_path, revision=args.revision, torch_dtype=weight_dtype
+        )
     pipeline = pipeline.to(accelerator.device)
 
     # load attention processors
     pipeline.unet.load_attn_procs(args.output_dir)
 
     # run inference
-    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+    generator = torch.Generator(device=accelerator.device).manual_seed(glb_seed)
     images = []
     for _ in range(args.num_validation_images):
         images.append(pipeline(args.validation_prompt, num_inference_steps=30, generator=generator).images[0])
